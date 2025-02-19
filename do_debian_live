@@ -1,0 +1,209 @@
+#!/bin/bash
+
+# Get the current Debian live disk package file and build a bootable
+# live disk image.
+# Author: Dave Gluss
+
+if (( $EUID != 0 )); then
+    echo This needs to be run as root, e.g. sudo $0
+    exit 1
+fi
+
+neededcommands=(
+    "/usr/bin/rsync rsync"
+    "/usr/bin/lb live-build"
+    "/usr/bin/mksquashfs squashfs-tools"
+)
+newpkgs=()
+for line in "${neededcommands[@]}"; do
+    read cmd pkg <<< $line
+    if [[ ! -x $cmd ]]; then newpkgs+=($pkg); fi
+done
+if [[ ${#newpkgs} > 0 ]]; then
+    echo GET ${newpkgs[@]}
+    apt install ${newpkgs[@]}
+fi
+
+while getopts d: arg; do
+    case "$arg" in
+        d)
+            NEWDISTRO=$OPTARG
+            ;;
+        *)
+            echo unknown switch $arg
+            exit 1
+            ;;
+    esac
+done
+
+set -x
+
+if [[ -z "$NEWDISTRO" ]]; then
+    WEBPACKAGEDIR=//cdimage.debian.org/cdimage/release/current-live/amd64/iso-hybrid
+    PACKAGEFILE=$(wget -O- https:$WEBPACKAGEDIR/SHA256SUMS |\
+                      awk '/cinnamon.iso.packages/{print $2}' |\
+                      sed 's/.packages/.log/')
+
+    NEWDISTRO=$(wget -O- https:$WEBPACKAGEDIR/$PACKAGEFILE |\
+                    head -1 | sed -e 's/^.*--distribution//' | awk '{print $1}')
+fi
+NEWDISTRO=bookworm
+MYDISTRO=$(awk -F = '/VERSION_CODENAME=/{print $2}' /etc/os-release)
+OLDDISTRO=$(awk -F = '/LB_DISTRIBUTION=/{print $2}' \
+                live_build/config/bootstrap | tr -d '"')
+if [[ "$NEWDISTRO" != "$OLDDISTRO" ]]; then
+    echo Distribution changed\!
+    rm -rf live_build
+fi
+if [[ ! -d live_build ]]; then
+    LIVE_BUILD_IS_NEW=true;
+fi
+
+function NO_COMMENTS {
+    sed -nEe 's/#.*//;s/[ \t]+/ /g;H;${x;s/\n//g;s/^ *//;p}'
+}
+
+# see man live-config.7:
+#    hooks=medium
+ExtraBootParams=$(NO_COMMENTS <<eobp
+    boot=live
+    config
+    persistence
+    timezone=$(cat /etc/timezone)
+eobp
+	   )
+
+ExtraPackages=$(NO_COMMENTS <<eopl
+    google-chrome-stable
+    ntp
+    locate
+    units
+    # debian-forensics
+    gparted
+    #    debian-installer-launcher
+    #grub # this fails???
+    grub-common
+    grub2-common
+    os-prober
+    # emacs -- you can't live without emacs.
+    emacs-bin-common
+    emacs-common
+    emacs-el
+    emacs-gtk
+    emacs
+    emacsen-common
+    # remote control
+    x2goserver
+    x2goclient
+    # to read epub
+    okular
+    okular-extra-backends
+    # nethack.
+    nethack-x11
+    # science
+    maxima
+    lyx
+    librecad
+    openscad
+    # database
+    mariadb-server
+    mycli
+eopl
+	   )
+
+rm -r live_build
+LIVE_BUILD_IS_NEW=true;
+
+mkdir live_build
+cd live_build
+
+#lb clean --binary
+#lb clean
+
+lb config --architectures amd64 -d $NEWDISTRO --parent-distribution $NEWDISTRO \
+   --binary-image iso-hybrid \
+   --archive-areas 'main non-free-firmware' \
+   --debian-installer live --debian-installer-distribution $NEWDISTRO \
+   --debian-installer-gui true \
+   --bootloaders syslinux,grub-efi \
+   --bootappend-live "$ExtraBootParams"
+
+if $LIVE_BUILD_IS_NEW; then
+    for f in /usr/share/doc/live-build/examples/auto/* ; do
+        bf=${f##*/}
+        cp $f auto/$bf
+    done
+    if [[ -r ../packages.tar ]]; then
+        tar xf ../packages.tar
+    fi
+fi
+
+rm config/package-lists/desktop.list.chroot
+for desktop in cinnamon xfce lxde; do
+    echo task-$desktop-desktop >> \
+         config/package-lists/desktop.list.chroot
+done
+printf "%s\n" $ExtraPackages | sort -u \
+                    > config/package-lists/extras.list.chroot
+
+echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >\
+     config/archives/google-chrome.list.chroot
+[[ -r config/archives/google-chrome.key.chroot ]] ||
+    gpg --no-default-keyring --keyring \
+        /etc/apt/trusted.gpg.d/google-chrome.gpg \
+        --export -a --output config/archives/google-chrome.key.chroot
+
+# Stop the beep on boot menu. Probably no longer relevant: grub does that,
+# but maybe this is what happens with legacy boot.
+mkdir -p config/bootloaders/isolinux
+sed -e '/menu title/s///' -e '/menu width/atimeout 50'\
+    /usr/share/live/build/bootloaders/syslinux_common/menu.cfg > \
+    config/bootloaders/isolinux/menu.cfg
+
+# I want it to automatically boot after the user has stared
+# at it for 15 stunned seconds. It's definitely grub that I need to fix.
+mkdir config/bootloaders/grub-pc
+CONFIGCFG=bootloaders/grub-pc/config.cfg
+sed -e '2iset timeout=20' /usr/share/live/build/$CONFIGCFG\
+    > config/$CONFIGCFG
+
+# the change to skel/.bashrc is a modification instead of replacement, thus:
+HOOK_DIR=config/hooks
+mkdir -p $HOOK_DIR/normal $HOOK_DIR/live
+
+HOOK=$HOOK_DIR/normal/0051-emacs-var.hook.chroot
+cat <<'EOD' > $HOOK
+#!/bin/sh
+BRC=/etc/skel/.bashrc
+echo export EDITOR=emacs >> $BRC
+echo alias e=emacs >> $BRC
+EOD
+chmod +x $HOOK
+
+# I think that "natural" scrolling is the right way.
+BLI_DIR=config/includes.chroot/etc/skel
+mkdir -p $BLI_DIR
+cat <<'EOF' > $BLI_DIR/.bash_login
+if [[ ! -e ~/.local/state/fixscroll ]]; then
+cat <<EOD | DISPLAY=:0 dconf load /
+[org/cinnamon]
+favorite-apps=['google-chrome.desktop', 'cinnamon-settings.desktop', 'org.gnome.Terminal.desktop', 'nemo.desktop']
+[org/cinnamon/desktop/peripherals/mouse]
+natural-scroll=true
+EOD
+if [[ $? ]]; then touch ~/.local/state/fixscroll; fi
+fi
+EOF
+
+COMPL=config/includes.chroot/usr/share/bash-completion
+mkdir -p $COMPL/completions
+# this should have already been there.
+cp /usr/share/bash-completion/bash_completion $COMPL
+
+# this should have been part of installing librecad.
+echo complete -G '"*.dxf"' librecad >\
+     $COMPL/completions/librecad
+
+lb build
+
+tar cf ../packages.tar cache/packages.*

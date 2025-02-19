@@ -1,0 +1,184 @@
+#!/bin/bash
+# Take the Debian live image that was built with do_debian_live
+# and blast it on to a USB key.
+# Author: Dave Gluss
+# -p persistance size in MB (1000)
+DEFAULT_PERSISTENCE=1000
+# -w VFAT data partition size in MB (2000)
+DEFAULT_WIN=2000
+# -d the usb stick to use, which will be destroyed. BE CAREFUL.
+# -i the ISO to base the bootable USB on.
+# -n don't kill running 
+# The rest will be a EXT filesystem.
+
+if (( $EUID != 0 )); then
+    echo This needs to be run as root, e.g. sudo $0
+    exit 1
+fi
+
+neededcommands=(
+    "/sbin/sfdisk fdisk"
+    "/sbin/wipefs util-linux"
+    "/sbin/mkfs.ext4 e2fsprogs"
+    "/sbin/mkfs.vfat dosfstools"
+)
+newpkgs=()
+for line in "${neededcommands[@]}"; do
+    read cmd pkg <<< $line
+    if [[ ! -x $cmd ]]; then newpkgs+=($pkg); fi
+done
+if [[ ${#newpkgs} > 0 ]]; then apt install ${newpkgs[@]}; fi
+
+U=${SUDO_USER:-$USER}
+
+DIR=/home/$U/Downloads
+
+# the hybrid image:
+ISO=$DIR/live_build/live-image-amd64.hybrid.iso
+OUTPUT_DISK=/dev/sda
+DATADIR=usbback/DATA
+WINDIR=usbback/WIN
+
+KILLNEMO=true
+while getopts p:w:d:i:k arg; do
+    case "$arg" in
+        p)
+            PSIZE=$OPTARG
+            ;;
+        d)
+            OUTPUT_DISK=$OPTARG
+            ;;
+        w)
+            WSIZE=$OPTARG
+            ;;
+        i)
+            ISO="$OPTARG"
+            ;;
+        n)
+            KILLNEMO=false
+            ;;
+        *)
+            echo unknown switch $arg
+            exit 1
+            ;;
+    esac
+done
+
+if $KILLNEMO; then
+    killall nemo
+fi
+
+if [[ ! -r "$ISO" ]]; then
+    echo $ISO "isn't here!"
+    exit 1
+fi
+
+STICKSIZE=$(( $(/usr/sbin/blockdev --getsz $OUTPUT_DISK) / 2048 ))
+
+ISOSIZE=$(ls -l "$ISO" | awk '{print int($5/1000000)+1}')
+
+AVAILABLESIZE=$(( $STICKSIZE - $ISOSIZE ))
+
+function percentize {
+    if [[ $1 = *% ]]; then
+        echo $(( $2 * ${1%\%} / 100))
+        exit
+    fi
+    echo "$1"
+}
+
+# how many megabytes of persistance size we want
+PSIZE=${PSIZE:-$DEFAULT_PERSISTENCE}
+PSIZE=$(percentize $PSIZE $AVAILABLESIZE)
+# how many megabytes of VFAT size we want
+WSIZE=${WSIZE:-$DEFAULT_WIN}
+WSIZE=$(percentize $WSIZE $AVAILABLESIZE)
+
+# echo STICKSIZE $STICKSIZE
+# echo AVAILABLESIZE $AVAILABLESIZE
+# echo ISOSIZE $ISOSIZE
+# echo PSIZE $PSIZE
+# echo WSIZE $WSIZE
+
+if (( $PSIZE + $WSIZE > $AVAILABLESIZE )); then
+    echo The stick is too small to hold the partitions:
+    echo ' Persistence ' $PSIZE
+    echo ' VFAT        ' $WSIZE
+    echo ' Base filesys' $ISOSIZE
+    echo ' Stick       ' $STICKSIZE
+    exit 1
+fi
+
+# verify the disk to use: DANGER DANGER
+disks=("`ls /dev/sd?`")
+if [[ ! "${disks[-1]}" = "$OUTPUT_DISK" ]]; then
+    echo DISK "$OUTPUT_DISK" IS NOT THE LAST sd DISK: BE SURE.
+fi
+
+echo THIS WILL ERASE \"$OUTPUT_DISK\". 'Are you sure? '
+read ans
+if [[ ! "${ans^^}" = Y ]]; then
+    exit 1
+fi
+
+set -x
+
+# make sure the USB key filesystems aren't mounted
+for d in ${OUTPUT_DISK}*; do
+    umount $d
+done
+
+# clear the USB key partition table/size info in the kernel
+partx -d - $OUTPUT_DISK
+
+: Copy $ISOSIZE MB
+# copy the live image to the USB key
+dd if="$ISO" of=$OUTPUT_DISK bs=8M oflag=direct status=progress
+sync
+
+# The hybrid ISO has two partitions.
+# add a third, extended, and fourth and fifth partitions. Don't touch the
+# first two.
+sfdisk -a --force $OUTPUT_DISK <<EOD 
+/dev/sda3 : start=, size=${WSIZE}M, type=0C
+/dev/sda4 : start=, type=5
+/dev/sda5 : start=, size=${PSIZE}M, type=83
+/dev/sda6 : start=, type=83
+EOD
+
+# tell the kernel about the new partitions, 3-6.
+#  partx - tell the kernel about the presence and numbering of on-disk
+#          partitions
+partx -a --nr 3:6 $OUTPUT_DISK
+
+# format the persistence partition
+mkfs.ext4 -F -L persistence -q ${OUTPUT_DISK}5
+
+# format the vfat partition
+mkfs.vfat -n WIN ${OUTPUT_DISK}3
+
+# format the data partition
+mkfs.ext4 -F -L DATA -q ${OUTPUT_DISK}6
+
+# set up the persistence partition
+mount ${OUTPUT_DISK}5 /mnt
+echo '/ union' >/mnt/persistence.conf
+umount /mnt
+sync
+
+# copy files to the data and win partition
+if [ -d "/home/$U/$DATADIR" ]; then
+    if [[ -d "/home/$U/$DATADIR" ]]; then
+        mount ${OUTPUT_DISK}6 /mnt
+        (cd "/home/$U/$DATADIR"; tar chf - --group=0 --owner=0 --exclude="*~"  .) |\
+            (cd /mnt;tar xvf -)
+        umount /mnt
+    fi
+    if [[ -d  "/home/$U/$WINDIR" ]]; then
+        mount ${OUTPUT_DISK}3 /mnt
+        (cd "/home/$U/$WINDIR"; tar chf - --group=0 --owner=0 --exclude="*~"  .) |\
+            (cd /mnt;tar xvf - || exit 0) # vfat can't hold owners.
+        umount /mnt
+    fi
+fi
+sync
