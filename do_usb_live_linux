@@ -110,7 +110,7 @@ if (( $PSIZE + $WSIZE > $AVAILABLESIZE )); then
 fi
 
 # verify the disk to use: DANGER DANGER
-disks=("`ls /dev/sd?`")
+disks=( /dev/sd? )
 if [[ ! "${disks[-1]}" = "$OUTPUT_DISK" ]]; then
     echo DISK "$OUTPUT_DISK" IS NOT THE LAST sd DISK: BE SURE.
 fi
