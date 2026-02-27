@@ -139,7 +139,7 @@ sync
 # The hybrid ISO has two partitions.
 # add a third, extended, and fourth and fifth partitions. Don't touch the
 # first two.
-sfdisk -a --force $OUTPUT_DISK <<EOD 
+sfdisk -a $OUTPUT_DISK <<EOD 
 /dev/sda3 : start=, size=${WSIZE}M, type=0C
 /dev/sda4 : start=, type=5
 /dev/sda5 : start=, size=${PSIZE}M, type=83

@@ -20,7 +20,7 @@ for line in "${neededcommands[@]}"; do
     if [[ ! -x $cmd ]]; then newpkgs+=($pkg); fi
 done
 if [[ ${#newpkgs} > 0 ]]; then
-    echo GET ${newpkgs[@]}
+    echo apt install ${newpkgs[@]}
     apt install ${newpkgs[@]}
 fi
 
@@ -47,7 +47,7 @@ if [[ -z "$NEWDISTRO" ]]; then
     NEWDISTRO=$(wget -O- https:$WEBPACKAGEDIR/$PACKAGEFILE |\
                     head -1 | sed -e 's/^.*--distribution//' | awk '{print $1}')
 fi
-NEWDISTRO=bookworm
+# NEWDISTRO=bookworm
 MYDISTRO=$(awk -F = '/VERSION_CODENAME=/{print $2}' /etc/os-release)
 OLDDISTRO=$(awk -F = '/LB_DISTRIBUTION=/{print $2}' \
                 live_build/config/bootstrap | tr -d '"')
@@ -73,7 +73,7 @@ ExtraBootParams=$(NO_COMMENTS <<eobp
 eobp
 	   )
 
-ExtraPackages=$(NO_COMMENTS <<eopl
+ExtraPackages=($(NO_COMMENTS <<eopl
     google-chrome-stable
     ntp
     locate
@@ -109,7 +109,13 @@ ExtraPackages=$(NO_COMMENTS <<eopl
     mariadb-server
     mycli
 eopl
-	   )
+	   ))
+
+if [[ $NEWDISTRO == trixie ]]; then
+    echo ADD firmware-iwlwifi
+    # trixie doesn't include iwlwifi by default?
+    ExtraPackages+=(firmware-iwlwifi chrony)
+fi
 
 rm -r live_build
 LIVE_BUILD_IS_NEW=true;
@@ -139,11 +145,12 @@ if $LIVE_BUILD_IS_NEW; then
 fi
 
 rm config/package-lists/desktop.list.chroot
-for desktop in cinnamon xfce lxde; do
+#for desktop in cinnamon xfce lxde; do
+for desktop in cinnamon; do
     echo task-$desktop-desktop >> \
          config/package-lists/desktop.list.chroot
 done
-printf "%s\n" $ExtraPackages | sort -u \
+printf "%s\n" ${ExtraPackages[*]} | sort -u \
                     > config/package-lists/extras.list.chroot
 
 echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >\
